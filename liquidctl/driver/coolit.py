@@ -1,15 +1,16 @@
-"""liquidctl driver for Corsair Platinum and PRO XT coolers.
+"""liquidctl driver for Corsair coolers using the CoolIT USB HID protocol.
 
 Supported devices
 -----------------
 
+ - Corsair Commander Mini
  - Corsair H110i GT
 
 Supported features
 ------------------
 
  - general monitoring
- - pump speed control
+ - pump speed control (H110i GT)
  - fan speed control
 
 Copyright Roberto Marques, Serphentas, and other contributors
@@ -21,7 +22,7 @@ import re
 
 from enum import Enum, unique
 
-from liquidctl.error import NotSupportedByDevice, NotSupportedByDriver
+from liquidctl.error import NotSupportedByDevice, NotSupportedByDriver, Timeout
 from liquidctl.driver.usb import UsbHidDriver
 from liquidctl.keyval import RuntimeStorage
 from liquidctl.util import clamp, fraction_of_byte, u16le_from, normalize_profile
@@ -29,9 +30,10 @@ from liquidctl.util import clamp, fraction_of_byte, u16le_from, normalize_profil
 LOGGER = logging.getLogger(__name__)
 
 _REPORT_LENGTH = 64
-_PUMP_INDEX = 0x02
 
+_COMMAND_DEVICE_ID = 0x00
 _COMMAND_FIRMWARE_ID = 0x01
+_COMMAND_TEMP_SELECT = 0x0C
 _COMMAND_TEMP_READ = 0x0E
 _COMMAND_FAN_SELECT = 0x10
 _COMMAND_FAN_MODE = 0x12
@@ -57,6 +59,28 @@ _PUMP_DEFAULT_EXTREME = [0x86, 0x0B]
 
 _SEQUENCE_MIN = 1
 _SEQUENCE_MAX = 255
+
+# Device IDs for USB 1b1c:0c04, from OpenCorsairLink's device table.
+_DEVICE_ID_COMMANDER_MINI = 0x3D
+_DEVICE_ID_H110I_GT = 0x41
+
+_DEVICES = {
+    _DEVICE_ID_COMMANDER_MINI: {
+        "description": "Corsair Commander Mini",
+        "fan_count": 6,
+        "has_pump": False,
+        "temp_sensor_count": 4,
+        "rgb_fans": False,
+    },
+    _DEVICE_ID_H110I_GT: {
+        "description": "Corsair H110i GT",
+        "fan_count": 2,
+        "has_pump": True,
+        "temp_sensor_count": 1,
+        "rgb_fans": False,
+    },
+}
+_DEFAULT_DEVICE_ID = _DEVICE_ID_H110I_GT
 
 
 @unique
@@ -109,19 +133,92 @@ def _quoted(*names):
 
 
 class Coolit(UsbHidDriver):
-    """liquidctl driver for Corsair H110i GT cooler"""
+    """liquidctl driver for Corsair CoolIT-based coolers"""
 
     _MATCHES = [
         (
             0x1B1C,
             0x0C04,
             "Corsair H110i GT",
-            {"has_pump": True, "fan_count": 2, "rgb_fans": False},
+            {"has_pump": True, "fan_count": 2, "temp_sensor_count": 1, "rgb_fans": False},
         ),
     ]
 
-    def __init__(self, device, description, fan_count, rgb_fans, **kwargs):
+    @classmethod
+    def probe(
+        cls, handle, vendor=None, product=None, release=None, serial=None, match=None, **kwargs
+    ):
+        """Probe `handle` and yield corresponding driver instances.
+
+        The supported devices share the USB vendor and product ID and are only
+        differentiated by a device ID that has to be read from the device.
+        """
+        for vid, pid, _, _ in cls._MATCHES:
+            if (vendor and vendor != vid) or handle.vendor_id != vid:
+                continue
+            if (product and product != pid) or handle.product_id != pid:
+                continue
+            if release and handle.release_number != release:
+                continue
+            if serial and handle.serial_number != serial:
+                continue
+            device_id = cls._read_device_id(handle)
+            if device_id not in _DEVICES:
+                LOGGER.warning(
+                    "unknown CoolIT device ID %s, falling back to %s",
+                    f"0x{device_id:02x}" if device_id is not None else "(read failed)",
+                    _DEVICES[_DEFAULT_DEVICE_ID]["description"],
+                )
+            params = dict(_DEVICES.get(device_id, _DEVICES[_DEFAULT_DEVICE_ID]))
+            description = params.pop("description")
+            if match and match.lower() not in description.lower():
+                continue
+            params.update(kwargs)
+            dev = cls(handle, description, **params)
+            LOGGER.debug(
+                "%s identified: %s (device ID %s)",
+                cls.__name__,
+                description,
+                f"0x{device_id:02x}" if device_id is not None else "(read failed)",
+            )
+            yield dev
+
+    @staticmethod
+    def _read_device_id(handle):
+        buf = bytearray(_REPORT_LENGTH)
+        buf[0] = 3
+        buf[1] = 1
+        buf[2] = _OP_CODE_READ_ONE_BYTE
+        buf[3] = _COMMAND_DEVICE_ID
+        try:
+            handle.open()
+        except (Timeout, OSError):
+            return None
+        try:
+            handle.clear_enqueued_reports()
+            handle.write(buf)
+            res = handle.read(_REPORT_LENGTH)
+        except (Timeout, OSError):
+            return None
+        finally:
+            handle.close()
+        return res[2] if res else None
+
+    def __init__(
+        self,
+        device,
+        description,
+        fan_count,
+        has_pump=True,
+        temp_sensor_count=1,
+        rgb_fans=False,
+        **kwargs,
+    ):
         super().__init__(device, description, **kwargs)
+        self._fan_count = fan_count
+        self._has_pump = has_pump
+        self._temp_sensor_count = temp_sensor_count
+        self._pump_index = fan_count if has_pump else None
         self._component_count = 1 + fan_count * rgb_fans
         self._fan_names = [f"fan{i + 1}" for i in range(fan_count)]
 
@@ -134,7 +231,7 @@ class Coolit(UsbHidDriver):
         ret = super().connect(**kwargs)
         ids = f"vid{self.vendor_id:04x}_pid{self.product_id:04x}"
         loc = "loc" + "_".join(re.findall(r"\d+", self.address))
-        self._data = RuntimeStorage(key_prefixes=[ids, loc])
+        self._data = kwargs.pop("runtime_storage", RuntimeStorage(key_prefixes=[ids, loc]))
         self._sequence = _sequence()
         return ret
 
@@ -149,11 +246,13 @@ class Coolit(UsbHidDriver):
 
         Returns a list of `(property, value, unit)` tuples.
         """
-        if pump_mode not in ["quiet", "extreme"]:
-            LOGGER.warning('pump mode must be either "quiet" or "extreme", falling back to "quiet"')
-            pump_mode = "quiet"
-
-        self._data.store("pump_mode", _PumpMode[pump_mode.upper()].value)
+        if self._has_pump:
+            if pump_mode not in ["quiet", "extreme"]:
+                LOGGER.warning(
+                    'pump mode must be either "quiet" or "extreme", falling back to "quiet"'
+                )
+                pump_mode = "quiet"
+            self._data.store("pump_mode", _PumpMode[pump_mode.upper()].value)
 
         res = self._send_command(
             self._build_data_package(_COMMAND_FIRMWARE_ID, _OP_CODE_READ_TWO_BYTES)
@@ -167,35 +266,31 @@ class Coolit(UsbHidDriver):
 
         Returns a list of `(property, value, unit)` tuples.
         """
+        if not self._has_pump:
+            return self._get_status_fan_controller()
+        return self._get_status_aio()
+
+    def _get_status_aio(self):
         dataPackages = list()
 
         # temperature
         dataPackages.append(self._build_data_package(_COMMAND_TEMP_READ, _OP_CODE_READ_TWO_BYTES))
 
-        # fan 1
-        dataPackages.append(
-            self._build_data_package(
-                _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([0])
+        # fans
+        for index in range(self._fan_count):
+            dataPackages.append(
+                self._build_data_package(
+                    _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([index])
+                )
             )
-        )
-        dataPackages.append(
-            self._build_data_package(_COMMAND_FAN_READ_RPM, _OP_CODE_READ_TWO_BYTES)
-        )
-
-        # fan 2
-        dataPackages.append(
-            self._build_data_package(
-                _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([1])
+            dataPackages.append(
+                self._build_data_package(_COMMAND_FAN_READ_RPM, _OP_CODE_READ_TWO_BYTES)
             )
-        )
-        dataPackages.append(
-            self._build_data_package(_COMMAND_FAN_READ_RPM, _OP_CODE_READ_TWO_BYTES)
-        )
 
         # pump
         dataPackages.append(
             self._build_data_package(
-                _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([2])
+                _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([self._pump_index])
             )
         )
         dataPackages.append(
@@ -206,12 +301,49 @@ class Coolit(UsbHidDriver):
 
         temp = res[3] + res[2] / 255
 
-        return [
-            ("Liquid temperature", temp, "°C"),
-            ("Fan 1 speed", u16le_from(res, offset=8), "rpm"),
-            ("Fan 2 speed", u16le_from(res, offset=14), "rpm"),
-            ("Pump speed", u16le_from(res, offset=20), "rpm"),
-        ]
+        status = [("Liquid temperature", temp, "°C")]
+        for index in range(self._fan_count):
+            status.append((f"Fan {index + 1} speed", u16le_from(res, offset=8 + index * 6), "rpm"))
+        status.append(("Pump speed", u16le_from(res, offset=8 + self._fan_count * 6), "rpm"))
+        return status
+
+    def _get_status_fan_controller(self):
+        tempPackages = list()
+        for index in range(self._temp_sensor_count):
+            tempPackages.append(
+                self._build_data_package(
+                    _COMMAND_TEMP_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([index])
+                )
+            )
+            tempPackages.append(
+                self._build_data_package(_COMMAND_TEMP_READ, _OP_CODE_READ_TWO_BYTES)
+            )
+
+        res = self._send_commands(tempPackages)
+
+        status = []
+        for index in range(self._temp_sensor_count):
+            offset = index * 6
+            status.append(
+                (f"Temperature {index + 1}", res[offset + 5] + res[offset + 4] / 256, "°C")
+            )
+
+        fanPackages = list()
+        for index in range(self._fan_count):
+            fanPackages.append(
+                self._build_data_package(
+                    _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([index])
+                )
+            )
+            fanPackages.append(
+                self._build_data_package(_COMMAND_FAN_READ_RPM, _OP_CODE_READ_TWO_BYTES)
+            )
+
+        res = self._send_commands(fanPackages)
+
+        for index in range(self._fan_count):
+            status.append((f"Fan {index + 1} speed", u16le_from(res, offset=index * 6 + 4), "rpm"))
+        return status
 
     def set_fixed_speed(self, channel, duty, **kwargs):
         """Set fan or fans to a fixed speed duty.
@@ -301,9 +433,7 @@ class Coolit(UsbHidDriver):
         return buf
 
     def _send_set_cooling(self):
-        for fan in self._fan_names:
-            fanIndex = 0 if fan == "fan1" else 1
-
+        for index, fan in enumerate(self._fan_names):
             mode = _FanMode(self._data.load(f"{fan}_mode", of_type=int))
 
             if mode is _FanMode.FIXED_DUTY:
@@ -311,7 +441,7 @@ class Coolit(UsbHidDriver):
                 duty = clamp(stored, 0, 100)
                 self._send_command(
                     self._build_data_package(
-                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([fanIndex])
+                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([index])
                     )
                 )
                 self._send_command(
@@ -338,10 +468,11 @@ class Coolit(UsbHidDriver):
                 fanDutyData = [0x0A]
 
                 # get max RPM for current fan
+                max_rpm_index = 0 if self._has_pump else index
                 dataPackages = []
                 dataPackages.append(
                     self._build_data_package(
-                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([0])
+                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([max_rpm_index])
                     )
                 )
                 dataPackages.append(
@@ -360,7 +491,7 @@ class Coolit(UsbHidDriver):
                 # select fan to customize
                 self._send_command(
                     self._build_data_package(
-                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([fanIndex])
+                        _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([index])
                     )
                 )
 
@@ -393,12 +524,15 @@ class Coolit(UsbHidDriver):
             else:
                 raise ValueError(f"Unsupported fan {mode}")
 
+        if not self._has_pump:
+            return
+
         pump_mode = _PumpMode(self._data.load("pump_mode", of_type=int))
 
         self._send_commands(
             [
                 self._build_data_package(
-                    _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([_PUMP_INDEX])
+                    _COMMAND_FAN_SELECT, _OP_CODE_WRITE_ONE_BYTE, params=bytes([self._pump_index])
                 ),
                 self._build_data_package(
                     _COMMAND_FAN_FIXED_RPM,
